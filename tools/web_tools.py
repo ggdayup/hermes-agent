@@ -16,6 +16,7 @@ Backend compatibility:
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
+- SearXNG: https://docs.searxng.org (search only; self-hosted, zero-cost)
 - Tavily: https://tavily.com (search, extract, crawl)
 
 LLM Processing:
@@ -72,6 +73,71 @@ def _has_env(name: str) -> bool:
     val = os.getenv(name)
     return bool(val and val.strip())
 
+def _has_searxng_config() -> bool:
+    """Return True when a SearXNG base URL is configured."""
+    return bool(
+        os.getenv("SEARXNG_BASE_URL", "").strip()
+        or (_load_web_config().get("searxng_base_url") or "").strip()
+    )
+
+def _is_searxng_available() -> bool:
+    if not _has_searxng_config():
+        return False
+    url = (
+        os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/")
+        or (_load_web_config().get("searxng_base_url") or "http://localhost:8888").strip().rstrip("/")
+    )
+    try:
+        r = httpx.get(url, timeout=3.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _searxng_search(query: str, limit: int = 5) -> dict:
+    """Search using a self-hosted SearXNG instance.
+
+    Requires SEARXNG_BASE_URL env var or web.searxng_base_url in config.yaml.
+    Optionally uses SEARXNG_API_KEY if the instance requires authentication.
+    """
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"error": "Interrupted", "success": False, "data": {"web": []}}
+
+    base_url = (
+        os.getenv("SEARXNG_BASE_URL", "").strip().rstrip("/")
+        or (_load_web_config().get("searxng_base_url") or "http://localhost:8888").strip().rstrip("/")
+    )
+    api_key = os.getenv("SEARXNG_API_KEY", "").strip()
+
+    if not base_url:
+        return {"error": "SEARXNG_BASE_URL not configured.", "success": False, "data": {"web": []}}
+
+    url = f"{base_url}/search"
+    params = {"q": query, "format": "json", "pageno": 1}
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        r = httpx.get(url, params=params, headers=headers, timeout=15.0)
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"SearXNG HTTP {e.response.status_code}", "success": False, "data": {"web": []}}
+    except Exception as e:
+        return {"error": f"SearXNG request failed: {e}", "success": False, "data": {"web": []}}
+
+    results = []
+    for i, item in enumerate(data.get("results", [])):
+        results.append({
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "description": item.get("content", ""),
+            "position": i + 1,
+            "category": item.get("category")
+        })
+    return {"success": True, "data": {"web": results[:limit]}}
+
 def _load_web_config() -> dict:
     """Load the ``web:`` section from ~/.hermes/config.yaml."""
     try:
@@ -88,13 +154,14 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("searxng", _is_searxng_available()),  # Zero-cost, priority for self-hosted
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -117,6 +184,8 @@ def _is_backend_available(backend: str) -> bool:
         return check_firecrawl_api_key()
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
+    if backend == "searxng":
+        return _is_searxng_available()
     return False
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1118,6 +1187,17 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
+
+        if backend == "searxng":
+            logger.info("SearXNG search: '%s' (limit: %d)", query, limit)
+            response_data = _searxng_search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
         response = _get_firecrawl_client().search(
@@ -1252,6 +1332,11 @@ async def web_extract_tool(
                     "include_images": False,
                 })
                 results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+            elif backend == "searxng":
+                # SearXNG doesn't support extract — fallback to Firecrawl
+                logger.warning("SearXNG doesn't support extract; falling back to Firecrawl")
+                backend = "firecrawl"
+                # Continue to Firecrawl extraction below
             else:
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
@@ -1542,6 +1627,11 @@ async def web_crawl_tool(
         effective_model = model or _get_default_summarizer_model()
         auxiliary_available = check_auxiliary_model()
         backend = _get_backend()
+
+        # SearXNG doesn't support crawl — fallback to Firecrawl
+        if backend == "searxng":
+            logger.warning("SearXNG doesn't support crawl; falling back to Firecrawl")
+            backend = "firecrawl"
 
         # Tavily supports crawl via its /crawl endpoint
         if backend == "tavily":
