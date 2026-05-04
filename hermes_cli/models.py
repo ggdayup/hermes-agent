@@ -2008,7 +2008,7 @@ def validate_requested_model(
             "message": "Model names cannot contain spaces.",
         }
 
-    if normalized == "custom":
+    if normalized == "custom" or normalized.startswith("custom:"):
         probe = probe_api_models(api_key, base_url)
         api_models = probe.get("models")
         if api_models is not None:
@@ -2062,8 +2062,8 @@ def validate_requested_model(
             message += f"\n  If this server expects `/v1`, try base URL: `{probe.get('suggested_base_url')}`"
 
         return {
-            "accepted": False,
-            "persist": False,
+            "accepted": True,
+            "persist": True,
             "recognized": False,
             "message": message,
         }
@@ -2105,6 +2105,41 @@ def validate_requested_model(
                     f"{suggestion_text}"
                 ),
             }
+
+    # Google Gemini CLI uses OAuth (cloudcode-pa://google) — no /v1/models endpoint.
+    # Validate against the static catalog instead of HTTP probing.
+    if normalized == "google-gemini-cli":
+        gemini_cli_models = _PROVIDER_MODELS.get("google-gemini-cli", [])
+        if requested_for_lookup in set(gemini_cli_models):
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        # Auto-correct if the top match is very similar (e.g. typo)
+        auto = get_close_matches(requested_for_lookup, gemini_cli_models, n=1, cutoff=0.9)
+        if auto:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "corrected_model": auto[0],
+                "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
+            }
+        suggestions = get_close_matches(requested, gemini_cli_models, n=3, cutoff=0.5)
+        suggestion_text = ""
+        if suggestions:
+            suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
+        return {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": (
+                f"Model `{requested}` was not found in the Google Gemini CLI model listing."
+                f"{suggestion_text}"
+            ),
+        }
 
     # Probe the live API to check if the model actually exists
     api_models = fetch_api_models(api_key, base_url)
