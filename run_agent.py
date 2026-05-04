@@ -7552,19 +7552,15 @@ class AIAgent:
                 if tc.function.name == "memory":
                     try:
                         args = json.loads(tc.function.arguments)
-                        flush_target = args.get("target", "memory")
-                        from tools.memory_tool import memory_tool as _memory_tool
-                        _memory_tool(
-                            action=args.get("action"),
-                            target=flush_target,
-                            content=args.get("content"),
-                            old_text=args.get("old_text"),
-                            store=self._memory_store,
+                        self._invoke_builtin_memory_tool_with_bridge(
+                            args,
+                            task_id="flush_memories",
+                            execution_path="flush",
                         )
                         if not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
-                        logger.debug("Memory flush tool call failed: %s", e)
+                        logger.debug("Memory flush tool call failed: exception_type=%s", type(e).__name__)
         except Exception as e:
             logger.debug("Memory flush API call failed: %s", e)
         finally:

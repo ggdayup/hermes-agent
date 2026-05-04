@@ -227,3 +227,51 @@ def test_sequential_memory_path_uses_bridge_helper(monkeypatch):
 
     assert calls == [({"action": "add", "target": "memory", "content": RAW_CONTENT}, "task-sequential-123456", "call-sequential-123456", "sequential")]
     assert messages[-1] == {"role": "tool", "content": "bridge-result", "tool_call_id": "call-sequential-123456"}
+
+
+def test_flush_memories_path_uses_bridge_helper(monkeypatch):
+    agent = _agent(MagicMock())
+    agent._memory_flush_min_turns = 1
+    agent.valid_tool_names = {"memory"}
+    agent._user_turn_count = 3
+    agent.api_mode = "chat_completions"
+    agent._cached_system_prompt = ""
+    agent.tools = [{"type": "function", "function": {"name": "memory", "parameters": {}}}]
+    agent.model = "test-model"
+    agent.quiet_mode = True
+
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(
+            name="memory",
+            arguments=json.dumps({"action": "add", "target": "memory", "content": RAW_CONTENT}),
+        )
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[tool_call]))]
+    )
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", lambda **_kwargs: response)
+    monkeypatch.setattr("agent.auxiliary_client._fixed_temperature_for_model", lambda _model: None)
+
+    # If flush_memories still calls tools.memory_tool directly, this fake prevents
+    # real memory writes but the assertion below will fail because the bridge
+    # helper was bypassed.
+    _patch_memory_tool(monkeypatch, json.dumps({"success": True}))
+
+    calls = []
+
+    def fake_helper(function_args, *, task_id="", tool_call_id="", execution_path=""):
+        calls.append((function_args, task_id, tool_call_id, execution_path))
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(agent, "_invoke_builtin_memory_tool_with_bridge", fake_helper)
+
+    messages = [
+        {"role": "user", "content": "remember this"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+
+    agent.flush_memories(messages, min_turns=0)
+
+    assert calls == [({"action": "add", "target": "memory", "content": RAW_CONTENT}, "flush_memories", "", "flush")]
+    assert all("_flush_sentinel" not in msg for msg in messages)
