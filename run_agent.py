@@ -7702,6 +7702,127 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    @staticmethod
+    def _memory_bridge_short_hash(value: str) -> str:
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+    @staticmethod
+    def _memory_bridge_short_id(value: str) -> str:
+        if not value:
+            return ""
+        return value[:16]
+
+    def _invoke_builtin_memory_tool_with_bridge(
+        self,
+        function_args: dict,
+        *,
+        task_id: str = "",
+        tool_call_id: str = "",
+        execution_path: str = "",
+    ) -> str:
+        """Invoke the built-in memory tool and observably bridge successful writes.
+
+        The returned value is exactly the built-in memory tool result. Result JSON
+        is parsed only to decide whether external memory providers should be
+        notified.
+        """
+        action = function_args.get("action")
+        target = function_args.get("target", "memory")
+        content = function_args.get("content")
+        content_text = content if isinstance(content, str) else ("" if content is None else str(content))
+        content_len = len(content_text)
+        log_fields = (
+            "action=%s target=%s content_len=%d session_hash=%s task_id=%s "
+            "tool_call_id=%s execution_path=%s"
+        )
+        log_values = (
+            action or "",
+            target or "",
+            content_len,
+            self._memory_bridge_short_hash(self.session_id or ""),
+            self._memory_bridge_short_id(task_id or ""),
+            self._memory_bridge_short_id(tool_call_id or ""),
+            execution_path or "",
+        )
+
+        try:
+            from tools.memory_tool import memory_tool as _memory_tool
+            result = _memory_tool(
+                action=action,
+                target=target,
+                content=content,
+                old_text=function_args.get("old_text"),
+                store=self._memory_store,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=memory_bridge.failed reason=memory_tool_exception exception_type=%s " + log_fields,
+                type(exc).__name__,
+                *log_values,
+            )
+            raise
+
+        def _log_skip(reason: str) -> None:
+            logger.debug("event=memory_bridge.skipped reason=%s " + log_fields, reason, *log_values)
+
+        try:
+            if action not in ("add", "replace"):
+                _log_skip("action_not_bridged")
+                return result
+
+            if not self._memory_manager:
+                _log_skip("no_manager")
+                return result
+
+            try:
+                parsed_result = json.loads(result)
+            except Exception:
+                _log_skip("result_unparseable")
+                return result
+
+            if not isinstance(parsed_result, dict):
+                _log_skip("result_not_dict")
+                return result
+
+            if parsed_result.get("success") is not True:
+                _log_skip("result_success_not_true")
+                return result
+
+            try:
+                summary = self._memory_manager.on_memory_write(action or "", target or "", content_text)
+            except Exception as exc:
+                logger.warning(
+                    "event=memory_bridge.failed reason=manager_exception exception_type=%s " + log_fields,
+                    type(exc).__name__,
+                    *log_values,
+                )
+                return result
+
+            summary = summary if isinstance(summary, dict) else {}
+            delivered = int(summary.get("delivered") or 0)
+            failed = int(summary.get("failed") or 0)
+            attempted = int(summary.get("attempted") or 0)
+            if delivered > 0 and failed == 0:
+                logger.info(
+                    "event=memory_bridge.notified attempted=%d delivered=%d failed=%d " + log_fields,
+                    attempted,
+                    delivered,
+                    failed,
+                    *log_values,
+                )
+            else:
+                _log_skip("manager_summary_not_delivered")
+            return result
+        except Exception as exc:
+            logger.warning(
+                "event=memory_bridge.failed reason=unexpected exception_type=%s " + log_fields,
+                type(exc).__name__,
+                *log_values,
+            )
+            return result
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -7741,26 +7862,12 @@ class AIAgent:
                 current_session_id=self.session_id,
             )
         elif function_name == "memory":
-            target = function_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=function_args.get("action"),
-                target=target,
-                content=function_args.get("content"),
-                old_text=function_args.get("old_text"),
-                store=self._memory_store,
+            return self._invoke_builtin_memory_tool_with_bridge(
+                function_args,
+                task_id=effective_task_id,
+                tool_call_id=tool_call_id or "",
+                execution_path="direct",
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                    )
-                except Exception:
-                    pass
-            return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
@@ -8257,25 +8364,12 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
-                target = function_args.get("target", "memory")
-                from tools.memory_tool import memory_tool as _memory_tool
-                function_result = _memory_tool(
-                    action=function_args.get("action"),
-                    target=target,
-                    content=function_args.get("content"),
-                    old_text=function_args.get("old_text"),
-                    store=self._memory_store,
+                function_result = self._invoke_builtin_memory_tool_with_bridge(
+                    function_args,
+                    task_id=effective_task_id,
+                    tool_call_id=tool_call.id,
+                    execution_path="sequential",
                 )
-                # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                    try:
-                        self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
-                            target,
-                            function_args.get("content", ""),
-                        )
-                    except Exception:
-                        pass
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")

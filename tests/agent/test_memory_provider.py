@@ -854,22 +854,26 @@ class TestOnMemoryWriteBridge:
     """
 
     def test_on_memory_write_add(self):
-        """on_memory_write fires for 'add' actions."""
+        """on_memory_write fires for 'add' actions and returns a summary."""
         mgr = MemoryManager()
         p = FakeMemoryProvider("ext")
+        mgr.add_provider(FakeMemoryProvider("builtin"))
         mgr.add_provider(p)
 
-        mgr.on_memory_write("add", "memory", "new fact")
+        summary = mgr.on_memory_write("add", "memory", "new fact")
         assert p.memory_writes == [("add", "memory", "new fact")]
+        assert summary == {"attempted": 1, "delivered": 1, "failed": 0, "providers": ["ext"]}
 
     def test_on_memory_write_replace(self):
-        """on_memory_write fires for 'replace' actions."""
+        """on_memory_write fires for 'replace' actions and returns a summary."""
         mgr = MemoryManager()
         p = FakeMemoryProvider("ext")
+        mgr.add_provider(FakeMemoryProvider("builtin"))
         mgr.add_provider(p)
 
-        mgr.on_memory_write("replace", "user", "updated pref")
+        summary = mgr.on_memory_write("replace", "user", "updated pref")
         assert p.memory_writes == [("replace", "user", "updated pref")]
+        assert summary == {"attempted": 1, "delivered": 1, "failed": 0, "providers": ["ext"]}
 
     def test_on_memory_write_remove_not_bridged(self):
         """The bridge intentionally skips 'remove' — only add/replace notify."""
@@ -927,18 +931,38 @@ class TestOnMemoryWriteBridge:
         assert tool_names.count("web_search") == 1
         assert len(existing_tools) == 3  # web_search + ext_recall + ext_remember
 
-    def test_on_memory_write_tolerates_provider_failure(self):
+    def test_on_memory_write_tolerates_provider_failure(self, caplog):
         """If a provider's on_memory_write raises, others still get notified."""
         mgr = MemoryManager()
-        bad = FakeMemoryProvider("builtin")
-        bad.on_memory_write = MagicMock(side_effect=RuntimeError("boom"))
+        bad = FakeMemoryProvider("bad")
+        bad.on_memory_write = MagicMock(side_effect=RuntimeError("secret provider failure"))
         good = FakeMemoryProvider("good")
-        mgr.add_provider(bad)
-        mgr.add_provider(good)
+        mgr.add_provider(FakeMemoryProvider("builtin"))
+        # Bypass registration's one-external-provider policy to verify the
+        # manager hook itself continues across provider failures.
+        mgr._providers.extend([bad, good])
 
-        mgr.on_memory_write("add", "user", "test")
+        with caplog.at_level("WARNING"):
+            summary = mgr.on_memory_write("add", "user", "test secret content")
         # Good provider still received the call despite bad provider crashing
-        assert good.memory_writes == [("add", "user", "test")]
+        assert good.memory_writes == [("add", "user", "test secret content")]
+        assert summary == {"attempted": 2, "delivered": 1, "failed": 1, "providers": ["bad", "good"]}
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "event=memory_bridge.provider_failed" in messages
+        assert "provider=bad" in messages
+        assert "exception_type=RuntimeError" in messages
+        assert "secret provider failure" not in messages
+        assert "test secret content" not in messages
+
+    def test_on_memory_write_summary_empty_when_only_builtin(self):
+        mgr = MemoryManager()
+        builtin = FakeMemoryProvider("builtin")
+        mgr.add_provider(builtin)
+
+        summary = mgr.on_memory_write("add", "memory", "new fact")
+
+        assert builtin.memory_writes == []
+        assert summary == {"attempted": 0, "delivered": 0, "failed": 0, "providers": []}
 
 
 class TestHonchoCadenceTracking:

@@ -312,21 +312,35 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(self, action: str, target: str, content: str) -> dict:
         """Notify external providers when the built-in memory tool writes.
 
         Skips the builtin provider itself (it's the source of the write).
+        Provider failures are logged in sanitized form and never stop later
+        providers. Returns an observability summary.
         """
+        summary = {"attempted": 0, "delivered": 0, "failed": 0, "providers": []}
+        content_len = len(content or "")
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
+            summary["attempted"] += 1
+            summary["providers"].append(provider.name)
             try:
                 provider.on_memory_write(action, target, content)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_memory_write failed: %s",
-                    provider.name, e,
+                summary["delivered"] += 1
+            except Exception as exc:
+                summary["failed"] += 1
+                logger.warning(
+                    "event=memory_bridge.provider_failed provider=%s action=%s target=%s "
+                    "content_len=%d exception_type=%s",
+                    provider.name,
+                    action or "",
+                    target or "",
+                    content_len,
+                    type(exc).__name__,
                 )
+        return summary
 
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
