@@ -2,6 +2,24 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Core Principles
+
+**Rule 1 — Think Before Coding.**
+No silent assumptions. State what you're assuming. Surface tradeoffs. Ask before guessing. Push back when a simpler approach exists.
+→ In practice: before touching code, verify the actual behavior (read the file, run the test, check the log). Don't infer from file names or comments.
+
+**Rule 2 — Simplicity First.**
+Minimum code that solves the problem. No speculative features. No abstractions for single-use code. If a senior engineer would call it overcomplicated — simplify.
+→ In practice: prefer a 10-line function over a new class. Don't add config flags "in case we need them later". Don't introduce helper modules for one caller.
+
+**Rule 3 — Surgical Changes.**
+Touch only what you must. Don't "improve" adjacent code, comments, or formatting. Don't refactor what isn't broken. Match existing style.
+→ In practice: if the fix is in `tools/web_tools.py`, don't reformat `tools/registry.py`. Use `patch` tool for targeted edits, not `write_file` for whole-file rewrites.
+
+**Rule 4 — Goal-Driven Execution.**
+Define success criteria. Loop until verified. Don't tell yourself what steps to follow — define what success looks like and iterate until it's met.
+→ In practice: "the test passes" not "I ran the test". "CI is green" not "I pushed". Run `scripts/run_tests.sh` and confirm before declaring done.
+
 ## Development Environment
 
 ```bash
