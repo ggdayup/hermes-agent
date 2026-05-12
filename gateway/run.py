@@ -3226,9 +3226,9 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
-            # /agents (/tasks alias) should be query-only and never interrupt.
-            if _cmd_def_inner and _cmd_def_inner.name == "agents":
-                return await self._handle_agents_command(event)
+            # /agents (/tasks alias) and /subagents should be query-only and never interrupt.
+            if _cmd_def_inner and _cmd_def_inner.name in ("agents", "subagents"):
+                return await self._handle_agents_command(event) if _cmd_def_inner.name == "agents" else await self._handle_subagents_command(event)
 
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
@@ -3366,6 +3366,9 @@ class GatewayRunner:
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "subagents":
+            return await self._handle_subagents_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -4967,7 +4970,139 @@ class GatewayRunner:
             lines.append("No active agents or running tasks.")
 
         return "\n".join(lines)
-    
+
+    async def _handle_subagents_command(self, event: MessageEvent) -> str:
+        """Handle /subagents — list, inspect, or replay subagent sidechain transcripts."""
+        from hermes_cli.config import get_hermes_home
+        import json as _json
+
+        session_key = self._session_key_for_source(event.source)
+        session_entry = self.session_store.get_or_create_session(event.source)
+        parent_sid = session_entry.session_id
+        sessions_dir = get_hermes_home() / "sessions"
+
+        parts = (event.text or "").split()
+        sub = parts[1].lower().strip() if len(parts) > 1 else "list"
+
+        if sub == "list":
+            subagents_dir = sessions_dir / parent_sid / "subagents"
+            if not subagents_dir.exists():
+                return "🔀 No subagents for this session."
+
+            index_path = subagents_dir / "index.jsonl"
+            if not index_path.exists():
+                return "🔀 No subagent index found."
+
+            entries = []
+            with open(index_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(_json.loads(line))
+                        except _json.JSONDecodeError:
+                            pass
+
+            if not entries:
+                return "🔀 No subagents recorded."
+
+            lines = [f"🔀 **Subagents** ({len(entries)}):", ""]
+            for e in entries:
+                icon = "✅" if e.get("status") == "completed" else "❌"
+                dur = e.get("duration_seconds", 0)
+                calls = e.get("api_calls", 0)
+                goal = (e.get("goal", "") or "")[:70]
+                sid = (e.get("child_session_id", "?") or "")[:12]
+                lines.append(f"{icon} `{sid}...` — {goal}")
+                lines.append(f"  {calls} calls · {dur:.0f}s · {e.get('status', '?')}")
+                lines.append("")
+            return "\n".join(lines)
+
+        elif sub == "show":
+            child_sid = parts[2].strip() if len(parts) > 2 else None
+            if not child_sid:
+                return "Usage: /subagents show <child_session_id>"
+
+            subagents_dir = sessions_dir / parent_sid / "subagents"
+            meta_path = subagents_dir / f"{child_sid}.meta.json"
+
+            if not meta_path.exists():
+                candidates = list(subagents_dir.glob(f"{child_sid}*.meta.json"))
+                if len(candidates) == 1:
+                    meta_path = candidates[0]
+                else:
+                    return f"No metadata found for `{child_sid}`"
+
+            meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+            tokens = meta.get("tokens", {})
+            lines = [
+                f"🔀 **Subagent:** `{meta.get('child_session_id', '?')}`",
+                "",
+                f"Status: {meta.get('status', '?')}",
+                f"Goal: {meta.get('goal', '?')}",
+                f"Model: {meta.get('model', '?')}",
+                f"API calls: {meta.get('api_calls', 0)}",
+                f"Duration: {meta.get('duration_seconds', 0):.1f}s",
+                f"Tokens: {tokens.get('input', 0):,} in / {tokens.get('output', 0):,} out",
+            ]
+            if meta.get("error"):
+                lines.append(f"Error: {meta['error']}")
+            lines.append(f"Transcript: `{meta.get('child_session_id', '?')}.jsonl`")
+            return "\n".join(lines)
+
+        elif sub == "replay":
+            child_sid = parts[2].strip() if len(parts) > 2 else None
+            if not child_sid:
+                return "Usage: /subagents replay <child_session_id>"
+
+            subagents_dir = sessions_dir / parent_sid / "subagents"
+            jsonl_path = subagents_dir / f"{child_sid}.jsonl"
+
+            if not jsonl_path.exists():
+                candidates = list(subagents_dir.glob(f"{child_sid}*.jsonl"))
+                if len(candidates) == 1:
+                    jsonl_path = candidates[0]
+                else:
+                    return f"No transcript found for `{child_sid}`"
+
+            lines = [f"🔀 **Replay:** `{child_sid}`", ""]
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = _json.loads(line)
+                        role = msg.get("role", "?")
+                        if role == "user":
+                            content = str(msg.get("content", ""))[:200]
+                            if content:
+                                lines.append(f"**User:** {content}")
+                                lines.append("")
+                        elif role == "assistant":
+                            content = str(msg.get("content", ""))[:200]
+                            if content:
+                                lines.append(f"**Assistant:** {content}")
+                                lines.append("")
+                            tool_calls = msg.get("tool_calls", [])
+                            for tc in tool_calls:
+                                fn = tc.get("function", {})
+                                lines.append(f"🔧 `{fn.get('name', '?')}`")
+                        elif role == "tool":
+                            content = str(msg.get("content", ""))[:200]
+                            if content:
+                                lines.append(f"↪ {content}")
+                                lines.append("")
+                    except _json.JSONDecodeError:
+                        pass
+
+            if len(lines) <= 2:
+                return "Empty transcript."
+            return "\n".join(lines)
+
+        else:
+            return f"Unknown subcommand: `{sub}`\nUsage: /subagents [list|show <id>|replay <id>]"
+
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
 

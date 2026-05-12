@@ -1753,6 +1753,8 @@ class HermesCLI:
                 if _detected:
                     self.model = _detected
         # Track whether model was explicitly chosen by the user or fell back
+
+
         # to the global default.  Provider-specific normalisation may override
         # the default silently but should warn when overriding an explicit choice.
         # A config model that matches the global fallback is NOT considered an
@@ -1764,14 +1766,26 @@ class HermesCLI:
 
         self._explicit_api_key = api_key
         self._explicit_base_url = base_url
-
-        # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
-        self.requested_provider = (
+        _initial_provider = (
             provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
         )
+
+        # Resolve model alias if provided
+        if self.model:
+            from hermes_cli.model_switch import resolve_alias
+            alias_result = resolve_alias(self.model, _initial_provider)
+            if alias_result:
+                alias_provider, self.model, _ = alias_result
+                # Only override the provider if it wasnt explicitly set to something else
+                if not provider:
+                    _initial_provider = alias_provider
+
+        self.requested_provider = _initial_provider
+
+
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
         self.api_mode = "chat_completions"
@@ -3608,6 +3622,147 @@ class HermesCLI:
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
 
+    def _handle_subagents_command(self, parts):
+        """Handle /subagents — list, inspect, or replay subagent sidechain transcripts."""
+        from hermes_cli.config import get_hermes_home
+
+        sessions_dir = get_hermes_home() / "sessions"
+        current_sid = getattr(self, "session_id", None)
+        if not current_sid:
+            _cprint("  No active session.")
+            return
+
+        sub = parts[1].lower().strip() if len(parts) > 1 else "list"
+
+        if sub == "list":
+            self._handle_subagents_list(current_sid, sessions_dir)
+        elif sub == "show":
+            child_sid = parts[2].strip() if len(parts) > 2 else None
+            if not child_sid:
+                _cprint("  Usage: /subagents show <child_session_id>")
+                return
+            self._handle_subagents_show(current_sid, child_sid, sessions_dir)
+        elif sub == "replay":
+            child_sid = parts[2].strip() if len(parts) > 2 else None
+            if not child_sid:
+                _cprint("  Usage: /subagents replay <child_session_id>")
+                return
+            self._handle_subagents_replay(current_sid, child_sid, sessions_dir)
+        else:
+            _cprint(f"  Unknown subcommand: {sub}")
+            _cprint("  Usage: /subagents [list|show <id>|replay <id>]")
+
+    def _handle_subagents_list(self, parent_sid, sessions_dir):
+        """List all subagents for the current session."""
+        subagents_dir = sessions_dir / parent_sid / "subagents"
+        if not subagents_dir.exists():
+            _cprint("  No subagents for this session.")
+            return
+
+        index_path = subagents_dir / "index.jsonl"
+        if not index_path.exists():
+            _cprint("  No subagent index found.")
+            return
+
+        import json
+        entries = []
+        with open(index_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+        if not entries:
+            _cprint("  No subagents recorded.")
+            return
+
+        _cprint(f"  Subagents ({len(entries)}):")
+        for e in entries:
+            icon = "✓" if e.get("status") == "completed" else "✗"
+            dur = e.get("duration_seconds", 0)
+            calls = e.get("api_calls", 0)
+            goal = e.get("goal", "")[:70]
+            sid = e.get("child_session_id", "?")[:12]
+            _cprint(f"    {icon} {sid}...  {goal}")
+            _cprint(f"       {calls} calls · {dur:.0f}s · {e.get('status', '?')}")
+
+    def _handle_subagents_show(self, parent_sid, child_sid, sessions_dir):
+        """Show metadata for a specific subagent."""
+        import json
+
+        subagents_dir = sessions_dir / parent_sid / "subagents"
+        meta_path = subagents_dir / f"{child_sid}.meta.json"
+
+        if not meta_path.exists():
+            # Try matching by prefix
+            candidates = list(subagents_dir.glob(f"{child_sid}*.meta.json"))
+            if len(candidates) == 1:
+                meta_path = candidates[0]
+            elif len(candidates) > 1:
+                _cprint(f"  Multiple matches. Use full session ID:")
+                for c in candidates:
+                    _cprint(f"    {c.stem}")
+                return
+            else:
+                _cprint(f"  No metadata found for {child_sid}")
+                return
+
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        _cprint(f"  Subagent: {meta.get('child_session_id', '?')}")
+        _cprint(f"  Status: {meta.get('status', '?')}")
+        _cprint(f"  Goal: {meta.get('goal', '?')}")
+        _cprint(f"  Model: {meta.get('model', '?')}")
+        _cprint(f"  API calls: {meta.get('api_calls', 0)}")
+        _cprint(f"  Duration: {meta.get('duration_seconds', 0):.1f}s")
+        tokens = meta.get("tokens", {})
+        _cprint(f"  Tokens: {tokens.get('input', 0):,} in / {tokens.get('output', 0):,} out")
+        if meta.get("error"):
+            _cprint(f"  Error: {meta['error']}")
+        _cprint(f"  Transcript: {subagents_dir}/{child_sid}.jsonl")
+
+    def _handle_subagents_replay(self, parent_sid, child_sid, sessions_dir):
+        """Replay the full transcript of a subagent."""
+        subagents_dir = sessions_dir / parent_sid / "subagents"
+        jsonl_path = subagents_dir / f"{child_sid}.jsonl"
+
+        if not jsonl_path.exists():
+            candidates = list(subagents_dir.glob(f"{child_sid}*.jsonl"))
+            if len(candidates) == 1:
+                jsonl_path = candidates[0]
+            else:
+                _cprint(f"  No transcript found for {child_sid}")
+                return
+
+        import json
+        _cprint(f"  --- Replay: {child_sid} ---")
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    role = msg.get("role", "?")
+                    if role == "user":
+                        content = str(msg.get("content", ""))[:200]
+                        _cprint(f"  User: {content}")
+                    elif role == "assistant":
+                        content = str(msg.get("content", ""))[:200]
+                        if content:
+                            _cprint(f"  Assistant: {content}")
+                        tool_calls = msg.get("tool_calls", [])
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            _cprint(f"  Tool: {fn.get('name', '?')}({fn.get('arguments', '')[:100]})")
+                    elif role == "tool":
+                        content = str(msg.get("content", ""))[:200]
+                        _cprint(f"  Result: {content}")
+                except json.JSONDecodeError:
+                    pass
+
     def _handle_paste_command(self):
         """Handle /paste — explicitly check clipboard for an image.
 
@@ -4900,6 +5055,18 @@ class HermesCLI:
             )
             return
 
+        # Load custom providers for the switch path (not just the picker path)
+        if user_provs is None or custom_provs is None:
+            try:
+                from hermes_cli.config import get_compatible_custom_providers, load_config
+                cfg = load_config()
+                if user_provs is None:
+                    user_provs = cfg.get("providers")
+                if custom_provs is None:
+                    custom_provs = get_compatible_custom_providers(cfg)
+            except Exception:
+                pass
+
         # Perform the switch
         result = switch_model(
             raw_input=model_input,
@@ -5760,6 +5927,8 @@ class HermesCLI:
             self._handle_stop_command()
         elif canonical == "agents":
             self._handle_agents_command()
+        elif canonical == "subagents":
+            self._handle_subagents_command(parts)
         elif canonical == "background":
             self._handle_background_command(cmd_original)
         elif canonical == "btw":

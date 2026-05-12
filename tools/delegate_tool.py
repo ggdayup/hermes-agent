@@ -27,6 +27,9 @@ from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
+# Thread lock for concurrent writes to subagent index.jsonl (batch mode)
+_index_lock = threading.Lock()
+
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
@@ -424,17 +427,104 @@ def _build_child_agent(
 
     return child
 
+def _write_sidechain_artifacts(
+    parent_agent,
+    child,
+    task: Dict[str, Any],
+    entry: Dict[str, Any],
+) -> None:
+    """Write subagent sidechain artifacts: meta.json + JSONL copy + index entry.
+
+    Thread-safe for batch mode (uses _index_lock for index.jsonl).
+    Uses get_hermes_home() for profile-safe paths (AGENTS.md rule #1).
+    Copies JSONL rather than symlinking to avoid broken-link issues on cleanup.
+    """
+    try:
+        from hermes_cli.config import get_hermes_home
+    except ImportError:
+        logger.debug("Could not import get_hermes_home, skipping sidechain write")
+        return
+
+    parent_sid = getattr(parent_agent, "session_id", None)
+    child_sid = getattr(child, "session_id", None)
+    if not parent_sid or not child_sid:
+        return
+
+    try:
+        sessions_dir = get_hermes_home() / "sessions"
+        subagents_dir = sessions_dir / parent_sid / "subagents"
+        subagents_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.debug("Could not create subagents dir: %s", exc)
+        return
+
+    # Copy JSONL transcript (not symlink — avoids broken links on session cleanup)
+    src_jsonl = sessions_dir / f"{child_sid}.jsonl"
+    dst_jsonl = subagents_dir / f"{child_sid}.jsonl"
+    if src_jsonl.exists() and not dst_jsonl.exists():
+        try:
+            dst_jsonl.write_bytes(src_jsonl.read_bytes())
+        except Exception as exc:
+            logger.debug("Could not copy JSONL for %s: %s", child_sid, exc)
+
+    # Build meta.json
+    child_model = getattr(child, "model", None)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    meta = {
+        "child_session_id": child_sid,
+        "parent_session_id": parent_sid,
+        "task_index": entry.get("task_index", 0),
+        "goal": task.get("goal", ""),
+        "toolsets": task.get("toolsets", []),
+        "model": child_model if isinstance(child_model, str) else None,
+        "status": entry.get("status", "unknown"),
+        "exit_reason": entry.get("exit_reason", "unknown"),
+        "api_calls": entry.get("api_calls", 0),
+        "duration_seconds": entry.get("duration_seconds", 0),
+        "tokens": entry.get("tokens", {}),
+        "tool_trace_count": len(entry.get("tool_trace", [])),
+        "error": entry.get("error"),
+        "created_at": now_iso,
+    }
+    try:
+        meta_path = subagents_dir / f"{child_sid}.meta.json"
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Could not write meta.json for %s: %s", child_sid, exc)
+
+    # Append to index.jsonl (thread-safe)
+    index_entry = {
+        "child_session_id": child_sid,
+        "task_index": entry.get("task_index", 0),
+        "goal": (task.get("goal", "") or "")[:120],
+        "status": entry.get("status", "unknown"),
+        "duration_seconds": entry.get("duration_seconds", 0),
+        "api_calls": entry.get("api_calls", 0),
+        "created_at": now_iso,
+    }
+    with _index_lock:
+        try:
+            index_path = subagents_dir / "index.jsonl"
+            with open(index_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(index_entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("Could not write index entry for %s: %s", child_sid, exc)
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
     child=None,
     parent_agent=None,
+    task=None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    if task is None:
+        task = {"goal": goal}
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -609,30 +699,28 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
+        # Write sidechain artifacts (meta.json, JSONL copy, index entry)
+        _write_sidechain_artifacts(parent_agent, child, task, entry)
+
         return entry
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
-        if child_progress_cb:
-            try:
-                child_progress_cb(
-                    "subagent.complete",
-                    preview=str(exc),
-                    status="failed",
-                    duration_seconds=duration,
-                    summary=str(exc),
-                )
-            except Exception as e:
-                logger.debug("Progress callback failure relay failed: %s", e)
-        return {
+        error_entry = {
             "task_index": task_index,
             "status": "error",
             "summary": None,
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            "exit_reason": "error",
+            "tokens": {"input": 0, "output": 0},
+            "tool_trace": [],
         }
+        # Write sidechain artifacts for error cases too
+        _write_sidechain_artifacts(parent_agent, child, task, error_entry)
+        return error_entry
 
     finally:
         # Stop the heartbeat thread so it doesn't keep touching parent activity
@@ -685,6 +773,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
+    model: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -724,6 +813,24 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # Apply per-call model/provider override from delegate_task's model parameter
+    if model:
+        if isinstance(model, dict):
+            override_model_name = model.get("model")
+            override_provider_name = model.get("provider")
+        elif isinstance(model, str):
+            override_model_name = model
+            override_provider_name = None
+        else:
+            override_model_name = None
+            override_provider_name = None
+        if override_model_name:
+            creds["model"] = override_model_name
+        # Always update provider: set to override value (or None to let child inherit).
+        # Previously only updated when override differed from parent — this meant
+        # string model="foo" kept stale provider from delegation config.
+        creds["provider"] = override_provider_name
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     if tasks and isinstance(tasks, list):
@@ -735,9 +842,18 @@ def delegate_task(
                 f"delegate_task calls, or increase "
                 f"delegation.max_concurrent_children in config.yaml."
             )
-        task_list = tasks
+        task_list = list(tasks)
+        # Inject top-level model into tasks that don't specify their own.
+        # delegate_task(model=...) applies to ALL tasks, not just single-task mode.
+        if model:
+            for t in task_list:
+                if "model" not in t:
+                    t["model"] = model
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task = {"goal": goal, "context": context, "toolsets": toolsets}
+        if model:
+            task["model"] = model
+        task_list = [task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -768,11 +884,23 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Per-task model override: if a task specifies its own model,
+            # apply it on top of the base creds for this specific child.
+            task_model = t.get("model")
+            child_model = creds["model"]
+            if task_model and isinstance(task_model, dict):
+                child_model = task_model.get("model", child_model)
+            elif task_model and isinstance(task_model, str):
+                child_model = task_model
+
+            task_provider = t.get("model", {}).get("provider") if isinstance(t.get("model"), dict) else None
+            child_provider = task_provider if task_provider else creds["provider"]
+
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
+                toolsets=t.get("toolsets") or toolsets, model=child_model,
                 max_iterations=effective_max_iter, task_count=n_tasks, parent_agent=parent_agent,
-                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_provider=child_provider, override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
                 override_acp_command=t.get("acp_command") or acp_command,
@@ -788,7 +916,7 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent, task=_t)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -804,6 +932,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    task=t,
                 )
                 futures[future] = i
 
