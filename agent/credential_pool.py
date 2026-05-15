@@ -1129,12 +1129,53 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 
         state = _load_provider_state(auth_store, "openai-codex")
         tokens = state.get("tokens") if isinstance(state, dict) else None
-        # Hermes owns its own Codex auth state — we do NOT auto-import from
-        # ~/.codex/auth.json at pool-load time.  OAuth refresh tokens are
-        # single-use, so sharing them with Codex CLI / VS Code causes
-        # refresh_token_reused race failures.  Users who want to adopt
-        # existing Codex CLI credentials get a one-time, explicit prompt
-        # via `hermes auth openai-codex`.
+
+        # If Hermes has no Codex tokens, try importing from the Codex CLI
+        # auth store (~/.codex/auth.json) for /model picker discovery.
+        # This is a read-only import — the Codex CLI refresh_token is NOT
+        # consumed, avoiding refresh_token_reused race failures.
+        if not (isinstance(tokens, dict) and tokens.get("access_token")):
+            try:
+                from pathlib import Path as _Path
+                codex_home = _Path(os.environ.get("CODEX_HOME", str(_Path.home() / ".codex")))
+                codex_auth = codex_home / "auth.json"
+                if codex_auth.exists():
+                    import json as _json
+                    codex_data = _json.loads(codex_auth.read_text())
+                    codex_tokens = codex_data.get("tokens", {})
+                    if isinstance(codex_tokens, dict) and codex_tokens.get("access_token"):
+                        active_sources.add("device_code")
+                        changed |= _upsert_entry(
+                            entries,
+                            provider,
+                            "device_code",
+                            {
+                                "source": "device_code",
+                                "auth_type": AUTH_TYPE_OAUTH,
+                                "access_token": codex_tokens.get("access_token", ""),
+                                "refresh_token": codex_tokens.get("refresh_token"),
+                                "base_url": "https://chatgpt.com/backend-api/codex",
+                                "last_refresh": state.get("last_refresh") if isinstance(state, dict) else None,
+                                "label": label_from_token(codex_tokens.get("access_token", ""), "device_code"),
+                            },
+                        )
+                        # Migrate into Hermes auth store providers for subsequent fast lookups.
+                        try:
+                            providers = auth_store.get("providers", {})
+                            providers["openai-codex"] = {
+                                "tokens": {
+                                    "access_token": codex_tokens.get("access_token", ""),
+                                    "refresh_token": codex_tokens.get("refresh_token"),
+                                },
+                                "last_refresh": datetime.utcnow().isoformat() + "Z",
+                            }
+                            auth_store["providers"] = providers
+                            _save_auth_store(auth_store)
+                        except Exception as exc:
+                            logger.debug("Codex CLI migration to auth store failed: %s", exc)
+            except Exception as exc:
+                logger.debug("Codex CLI auth.json import failed: %s", exc)
+
         if isinstance(tokens, dict) and tokens.get("access_token"):
             active_sources.add("device_code")
             changed |= _upsert_entry(

@@ -117,6 +117,19 @@ class TestResolveProviderClientNamedCustom:
         assert model == "my-model"
         assert "beans.local" in str(client.base_url)
 
+    def test_custom_colon_named_custom_provider(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {"name": "ollama", "base_url": "http://localhost:11434/v1", "api_key": ""},
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+        client, model = resolve_provider_client("custom:ollama", "qwen3.6:27b")
+        assert client is not None
+        assert model == "qwen3.6:27b"
+        assert "localhost:11434" in str(client.base_url)
+
     def test_named_custom_provider_default_model(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "main-model"},
@@ -153,6 +166,41 @@ class TestResolveProviderClientNamedCustom:
         # "coffee" doesn't exist in custom_providers
         client, model = resolve_provider_client("coffee", "test")
         assert client is None
+
+
+class TestResolveProviderClientCredentialPool:
+    """Direct API-key providers should use credential pools before env fallback."""
+
+    def test_direct_api_key_provider_uses_credential_pool(self, tmp_path):
+        _write_config(tmp_path, {"model": {"default": "test-model"}})
+
+        class FakeEntry:
+            runtime_api_key = "pool-gemini-key"
+            runtime_base_url = "https://pool-gemini.example/v1beta/openai"
+
+        class FakePool:
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                return FakeEntry()
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=FakePool()),
+            patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={}),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, model = resolve_provider_client("gemini", "models/gemini-3.1-pro-preview")
+
+        assert client is not None
+        assert model == "models/gemini-3.1-pro-preview"
+        mock_openai.assert_called_once()
+        _, kwargs = mock_openai.call_args
+        assert kwargs["api_key"] == "pool-gemini-key"
+        assert kwargs["base_url"] == "https://pool-gemini.example/v1beta/openai"
 
 
 class TestResolveProviderClientModelNormalization:

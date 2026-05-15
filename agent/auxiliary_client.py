@@ -1424,7 +1424,10 @@ def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     _validate_proxy_env_urls()
-    # Normalise aliases
+    # Normalise aliases. Keep the raw requested provider so explicit named
+    # custom providers like "custom:ollama" can still be resolved after the
+    # generic alias normalizer strips the prefix for built-in routing.
+    requested_provider = (provider or "auto").strip().lower()
     provider = _normalize_aux_provider(provider)
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
@@ -1570,7 +1573,8 @@ def resolve_provider_client(
     # ── Named custom providers (config.yaml custom_providers list) ───
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        custom_entry = _get_named_custom_provider(provider)
+        custom_lookup_provider = requested_provider if requested_provider.startswith("custom:") else provider
+        custom_entry = _get_named_custom_provider(custom_lookup_provider)
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
@@ -1621,6 +1625,33 @@ def resolve_provider_client(
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model) if async_mode else (client, final_model))
+
+        pool_present, entry = _select_pool_entry(provider)
+        if pool_present:
+            api_key = _pool_runtime_api_key(entry)
+            if not api_key:
+                logger.debug(
+                    "resolve_provider_client: provider %s has a credential pool but no usable key",
+                    provider,
+                )
+                return None, None
+            base_url = _to_openai_base_url(
+                _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
+            )
+            final_model = _normalize_resolved_model(model or _API_KEY_PROVIDER_AUX_MODELS.get(provider, ""), provider)
+            headers = {}
+            if "api.kimi.com" in base_url.lower():
+                headers["User-Agent"] = "KimiCLI/1.30.0"
+            elif "api.githubcopilot.com" in base_url.lower():
+                from hermes_cli.models import copilot_default_headers
+
+                headers.update(copilot_default_headers())
+            client = OpenAI(api_key=api_key, base_url=base_url,
+                            **({"default_headers": headers} if headers else {}))
+            client = _wrap_if_needed(client, final_model, base_url)
+            logger.debug("resolve_provider_client: %s (%s) via pool", provider, final_model)
+            return (_to_async_client(client, final_model) if async_mode
+                    else (client, final_model))
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
