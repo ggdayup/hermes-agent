@@ -186,22 +186,30 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 
     The module must have either:
     - A register(ctx) function (plugin-style) — we simulate a ctx
-    - A top-level class that extends MemoryProvider — we instantiate it
+    - A top-level class that extends MemoryProvider — instantiate it
     """
     name = provider_dir.name
+    logger.info("[MEM-PROVIDER] _load_provider_from_dir('%s') called", name)
+    logger.info("[MEM-PROVIDER]   provider_dir=%s", provider_dir)
+    logger.info("[MEM-PROVIDER]   _MEMORY_PLUGINS_DIR=%s", _MEMORY_PLUGINS_DIR)
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
     _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
     module_name = f"plugins.memory.{name}" if _is_bundled else f"_hermes_user_memory.{name}"
     init_file = provider_dir / "__init__.py"
+    logger.info("[MEM-PROVIDER]   _is_bundled=%s, module_name=%s", _is_bundled, module_name)
+    logger.info("[MEM-PROVIDER]   init_file exists=%s", init_file.exists())
 
     if not init_file.exists():
+        logger.info("[MEM-PROVIDER]   init_file not found, returning None")
         return None
 
     # Check if already loaded
     if module_name in sys.modules:
         mod = sys.modules[module_name]
+        logger.info("[MEM-PROVIDER]   module already in sys.modules: %s", mod)
     else:
+        logger.info("[MEM-PROVIDER]   module NOT in sys.modules, loading fresh")
         # Handle relative imports within the plugin
         # First ensure the parent packages are registered
         for parent in ("plugins", "plugins.memory"):
@@ -220,8 +228,9 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                         sys.modules[parent] = parent_mod
                         try:
                             spec.loader.exec_module(parent_mod)
-                        except Exception:
-                            pass
+                            logger.info("[MEM-PROVIDER]   parent package loaded: %s", parent)
+                        except Exception as e:
+                            logger.info("[MEM-PROVIDER]   parent package load failed: %s: %s", parent, e)
 
         # Now load the provider module
         spec = importlib.util.spec_from_file_location(
@@ -229,6 +238,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
             submodule_search_locations=[str(provider_dir)]
         )
         if not spec:
+            logger.info("[MEM-PROVIDER]   spec_from_file_location returned None")
             return None
 
         mod = importlib.util.module_from_spec(spec)
@@ -252,23 +262,45 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                         sub_spec.loader.exec_module(sub_mod)
                     except Exception as e:
                         logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+                        logger.warning("[MEM-PROVIDER]   submodule load failed: %s: %s", full_sub_name, e)
+                        # CRITICAL: Remove partially loaded submodule from sys.modules
+                        # so it doesn't poison future import attempts
+                        sys.modules.pop(full_sub_name, None)
 
         try:
             spec.loader.exec_module(mod)
+            logger.info("[MEM-PROVIDER]   exec_module succeeded")
         except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+            logger.warning("[MEM-PROVIDER]   exec_module FAILED for %s: %s", module_name, e)
+            import traceback
+            logger.info("[MEM-PROVIDER]   traceback: %s", traceback.format_exc())
+            # CRITICAL: Clean up both the main module AND any pre-loaded submodules
+            # to prevent sys.modules pollution on retry
             sys.modules.pop(module_name, None)
+            for _sub_file in provider_dir.glob("*.py"):
+                if _sub_file.name == "__init__.py":
+                    continue
+                _sub_name = _sub_file.stem
+                _full_sub_name = f"{module_name}.{_sub_name}"
+                sys.modules.pop(_full_sub_name, None)
             return None
 
     # Try register(ctx) pattern first (how our plugins are written)
+    logger.info("[MEM-PROVIDER]   hasattr(mod, 'register')=%s", hasattr(mod, "register"))
     if hasattr(mod, "register"):
         collector = _ProviderCollector()
         try:
             mod.register(collector)
+            logger.info("[MEM-PROVIDER]   register() called, collector.provider=%s", collector.provider)
             if collector.provider:
+                logger.info("[MEM-PROVIDER]   returning provider: %s", collector.provider)
                 return collector.provider
+            else:
+                logger.warning("[MEM-PROVIDER]   register() succeeded but collector.provider is None")
         except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+            logger.warning("[MEM-PROVIDER]   register() exception: %s", e)
+            import traceback
+            logger.info("[MEM-PROVIDER]   register traceback: %s", traceback.format_exc())
 
     # Fallback: find a MemoryProvider subclass and instantiate it
     from agent.memory_provider import MemoryProvider
@@ -277,10 +309,12 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
         if (isinstance(attr, type) and issubclass(attr, MemoryProvider)
                 and attr is not MemoryProvider):
             try:
+                logger.info("[MEM-PROVIDER]   found MemoryProvider subclass: %s", attr_name)
                 return attr()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.info("[MEM-PROVIDER]   instantiation failed for %s: %s", attr_name, e)
 
+    logger.warning("[MEM-PROVIDER]   no provider found after all attempts for '%s'", name)
     return None
 
 

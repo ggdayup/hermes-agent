@@ -30,6 +30,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
+from .hindsight_error_classifier import format_error_response, classify_error
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _run_sync(coro, timeout: float = 120.0):
+def _run_sync(coro, timeout: float = 180.0):
     """Schedule *coro* on the shared loop and block until done."""
     loop = _get_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -659,9 +660,8 @@ class HindsightMemoryProvider(MemoryProvider):
             result = self._prefetch_result
             self._prefetch_result = ""
         if not result:
-            logger.debug("Prefetch: no results available")
             return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
+        logger.info("Hindsight prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
@@ -671,11 +671,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
             return
         if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
             return
+        logger.info("Hindsight prefetch: bank=%s, budget=%s, method=%s, query=%r",
+                     self._bank_id, self._budget, self._prefetch_method, query[:80])
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
@@ -739,8 +739,8 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._turn_counter, self._turn_counter + (self._retain_every_n_turns - self._turn_counter % self._retain_every_n_turns))
             return
 
-        logger.debug("sync_turn: retaining %d turns, total session content %d chars",
-                     len(self._session_turns), sum(len(t) for t in self._session_turns))
+        logger.info("Hindsight retain: %d turns, %d chars, bank=%s",
+                     len(self._session_turns), sum(len(t) for t in self._session_turns), self._bank_id)
         # Send the ENTIRE session as a single JSON array (document_id deduplicates).
         # Each element in _session_turns is a JSON string of that turn's messages.
         content = "[" + ",".join(self._session_turns) + "]"
@@ -756,13 +756,22 @@ class HindsightMemoryProvider(MemoryProvider):
                     item["tags"] = self._tags
                 logger.debug("Hindsight retain: bank=%s, doc=%s, async=%s, content_len=%d, num_turns=%d",
                              self._bank_id, self._session_id, self._retain_async, len(content), len(self._session_turns))
-                _run_sync(client.aretain_batch(
-                    bank_id=self._bank_id,
-                    items=[item],
-                    document_id=self._session_id,
-                    retain_async=self._retain_async,
-                ))
-                logger.debug("Hindsight retain succeeded")
+                # aiohttp 3.12+ TimerContext requires asyncio.current_task() to return
+                # a valid task, but run_coroutine_threadsafe may not satisfy this.
+                # Workaround: temporarily disable aiohttp's timeout (set to None),
+                # letting _run_sync's future.result(timeout=180) provide actual timeout.
+                saved = client._timeout
+                client._timeout = None
+                try:
+                    _run_sync(client.aretain_batch(
+                        bank_id=self._bank_id,
+                        items=[item],
+                        document_id=self._session_id,
+                        retain_async=self._retain_async,
+                    ))
+                finally:
+                    client._timeout = saved
+                logger.info("Hindsight retain succeeded: bank=%s, doc=%s", self._bank_id, self._session_id)
             except Exception as e:
                 logger.warning("Hindsight sync failed: %s", e, exc_info=True)
 
@@ -796,12 +805,20 @@ class HindsightMemoryProvider(MemoryProvider):
                     retain_kwargs["tags"] = self._tags
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
-                _run_sync(client.aretain(**retain_kwargs))
+                # aiohttp 3.12+ TimerContext requires asyncio.current_task() to return
+                # a valid task, but run_coroutine_threadsafe may not satisfy this.
+                # Workaround: temporarily disable aiohttp's internal timeout.
+                saved = client._timeout
+                client._timeout = None
+                try:
+                    _run_sync(client.aretain(**retain_kwargs))
+                finally:
+                    client._timeout = saved
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
             except Exception as e:
-                logger.warning("hindsight_retain failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to store memory: {e}")
+                logger.warning("hindsight_retain failed: %s [%s]", e, classify_error(e)["type"], exc_info=True)
+                return format_error_response(e)
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
@@ -827,8 +844,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
-                logger.warning("hindsight_recall failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to search memory: {e}")
+                logger.warning("hindsight_recall failed: %s [%s]", e, classify_error(e)["type"], exc_info=True)
+                return format_error_response(e)
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
@@ -843,10 +860,37 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
-                logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to reflect: {e}")
+                logger.warning("hindsight_reflect failed: %s [%s]", e, classify_error(e)["type"], exc_info=True)
+                return format_error_response(e)
 
         return tool_error(f"Unknown tool: {tool_name}")
+
+    def on_memory_write(self, action: str, target: str, content: str) -> None:
+        """Mirror built-in memory writes to Hindsight for backup.
+
+        Called when memory_tool.py add/replace/remove fires. Only backs up
+        add/replace — removals are not mirrored (deleted entries should not
+        be re-added to L2). Runs in a daemon thread so it's non-blocking.
+        """
+        if action not in ("add", "replace"):
+            return
+
+        def _backup():
+            try:
+                client = self._get_client()
+                ctx = f"builtin_memory:{action}:{target}"
+                logger.debug("on_memory_write: backing up %s to Hindsight (context=%s, len=%d)",
+                             action, ctx, len(content))
+                _run_sync(client.aretain(
+                    bank_id=self._bank_id,
+                    content=content,
+                    context=ctx,
+                    tags=["builtin_mirror", target],
+                ))
+            except Exception as e:
+                logger.warning("Hindsight on_memory_write backup failed: %s", e, exc_info=True)
+
+        threading.Thread(target=_backup, daemon=True, name="hindsight-memory-backup").start()
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: waiting for background threads")

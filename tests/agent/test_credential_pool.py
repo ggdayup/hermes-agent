@@ -257,6 +257,8 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
         "hermes_cli.auth._import_codex_cli_tokens",
         lambda: None,
     )
+    # Also point CODEX_HOME to nonexistent dir so direct file read finds nothing
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
     _write_auth_store(
         tmp_path,
         {

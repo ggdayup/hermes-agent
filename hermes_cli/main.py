@@ -5234,9 +5234,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
 
     # Build git command once — reused for fork detection and the update itself.
-    git_cmd = ["git"]
+    git_cmd = [shutil.which("git") or "git"]
     if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+        git_cmd = [shutil.which("git") or "git", "-c", "windows.appendAtomically=false"]
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
