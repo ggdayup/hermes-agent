@@ -503,6 +503,16 @@ automatically scope to the active profile.
    This is intentional — it lets `hermes -p coder profile list` see all profiles regardless
    of which one is active.
 
+## External Agent Tools Integration
+
+### Antigravity CLI (`agy`)
+We have the **Antigravity CLI** (`agy`) installed as a premium agentic coding tool (binary located at `~/.local/bin/agy`, config at `~/.gemini/antigravity-cli/`). It serves as a powerful coding coprocessor for complex refactoring, background compilation, and automated task loops.
+- **Skill Reference**: Always load/refer to the `antigravity-cli` skill (`~/.hermes/skills/devops/antigravity-cli/SKILL.md`) for full command reference, startup flags (`--dangerously-skip-permissions`, `--sandbox`), slash commands (`/goal`, `/grill-me`, `/schedule`), and setting file formats.
+- **Task Delegation**: We can call `agy` directly using the terminal tool to offload heavy coding/refactoring tasks programmatically:
+  ```bash
+  agy --dangerously-skip-permissions -p "Analyze current directory and refactor foo.py"
+  ```
+
 ## Known Pitfalls
 
 ### DO NOT hardcode `~/.hermes` paths
